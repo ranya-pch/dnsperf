@@ -36,6 +36,8 @@
 
 static SSL_CTX* ssl_ctx = 0;
 
+static int g_ex_index = -1;
+
 #define self ((struct perf__dot_socket*)sock)
 
 struct perf__dot_socket {
@@ -64,6 +66,23 @@ struct perf__dot_socket {
     uint64_t     handshakes_full, handshakes_resumed;
 };
 
+static int dot_new_session_cb(SSL *s, SSL_SESSION *sess) {
+    struct perf__dot_socket *ps = SSL_get_ex_data(s, g_ex_index);
+    if (!ps || !sess) return 0;
+
+    SSL_SESSION_up_ref(sess); // take ownership
+
+    PERF_LOCK(&ps->lock);
+    if (ps->session) {
+        SSL_SESSION_free(ps->session);
+    }
+    ps->session = sess;
+    PERF_UNLOCK(&ps->lock);
+
+    perf_log_printf("DoT: received TLS 1.3 session ticket");
+    return 1; // keep in OpenSSL's cache too
+}
+
 static void perf__dot_connect(struct perf_net_socket* sock)
 {
     int ret;
@@ -85,6 +104,10 @@ static void perf__dot_connect(struct perf_net_socket* sock)
     if (!(self->ssl = SSL_new(ssl_ctx))) {
         perf_log_fatal("SSL_new(): %s", ERR_error_string(ERR_get_error(), 0));
     }
+
+    if (g_ex_index != -1) {
+    SSL_set_ex_data(self->ssl, g_ex_index, self);
+}
 
     if (self->session) {
         if (!(ret = SSL_set_session(self->ssl, self->session))) {
@@ -195,7 +218,7 @@ static ssize_t perf__dot_recv(struct perf_net_socket* sock, void* buf, size_t le
             case SSL_ERROR_SYSCALL:
                 switch (errno) {
                 case EBADF:
-                    // treat this as a retry, can happen if sendto is reconnecting
+                    // treat as a retry, can happen if sendto is reconnecting
                 case ECONNREFUSED:
                 case ECONNRESET:
                 case ENOTCONN:
@@ -251,7 +274,6 @@ static ssize_t perf__dot_recv(struct perf_net_socket* sock, void* buf, size_t le
 static ssize_t perf__dot_sendto(struct perf_net_socket* sock, uint16_t qid, const void* buf, size_t len, int flags, const struct sockaddr* dest_addr, socklen_t addrlen)
 {
     size_t send = len < TCP_SEND_BUF_SIZE - 2 ? len : (TCP_SEND_BUF_SIZE - 2);
-    // TODO: We only send what we can send, because we can't continue sending
     uint16_t dnslen = htons(send);
     ssize_t  n;
 
@@ -529,6 +551,15 @@ struct perf_net_socket* perf_net_dot_opensocket(const perf_sockaddr_t* server, c
 #endif
         SSL_CTX_set_mode(ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
         SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT);
+
+        g_ex_index = SSL_get_ex_new_index(0, "dot_socket", NULL, NULL, NULL);
+if (g_ex_index == -1) {
+    perf_log_fatal("SSL_get_ex_new_index() failed");
+}
+
+// register callback to capture new session tickets
+SSL_CTX_sess_set_new_cb(ssl_ctx, dot_new_session_cb);
+
     }
 
     perf__dot_connect(sock);
