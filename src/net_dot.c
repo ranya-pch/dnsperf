@@ -557,7 +557,7 @@ if (g_ex_index == -1) {
     perf_log_fatal("SSL_get_ex_new_index() failed");
 }
 
-// register callback to capture new session tickets
+// register callback to capture new session tickets */
 SSL_CTX_sess_set_new_cb(ssl_ctx, dot_new_session_cb);
 
     }
