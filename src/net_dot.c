@@ -66,18 +66,36 @@ struct perf__dot_socket {
     uint64_t     handshakes_full, handshakes_resumed;
 };
 
+static void SSL_keylog_cb(const SSL *ssl, const char *line) {
+    fprintf(stderr, ">>> KEYLOG CALLBACK called: %s\n", line);
+    const char *path = getenv("SSLKEYLOGFILE");
+    if (!path) {
+        fprintf(stderr, ">>> SSLKEYLOGFILE not set!\n");
+        return;
+    }
+
+    FILE *fp = fopen(path, "a");
+    if (!fp) {
+        fprintf(stderr, ">>> Failed to open %s for writing\n", path);
+        return;
+    }
+
+    fprintf(fp, "%s\n", line);
+    fclose(fp);
+}
+
 static int dot_new_session_cb(SSL *s, SSL_SESSION *sess) {
     struct perf__dot_socket *ps = SSL_get_ex_data(s, g_ex_index);
     if (!ps || !sess) return 0;
 
     SSL_SESSION_up_ref(sess); // take ownership
 
-    PERF_LOCK(&ps->lock);
     if (ps->session) {
         SSL_SESSION_free(ps->session);
     }
     ps->session = sess;
-    PERF_UNLOCK(&ps->lock);
+
+    save_session_to_file(sess, "/tmp/dnsperf.session");
 
     perf_log_printf("DoT: received TLS 1.3 session ticket");
     return 1; // keep in OpenSSL's cache too
@@ -103,6 +121,10 @@ static void perf__dot_connect(struct perf_net_socket* sock)
     }
     if (!(self->ssl = SSL_new(ssl_ctx))) {
         perf_log_fatal("SSL_new(): %s", ERR_error_string(ERR_get_error(), 0));
+    }
+
+    if (!self->session) {
+    self->session = load_session_from_file("/tmp/dnsperf.session");
     }
 
     if (g_ex_index != -1) {
@@ -544,6 +566,7 @@ struct perf_net_socket* perf_net_dot_opensocket(const perf_sockaddr_t* server, c
         if (!SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION)) {
             perf_log_fatal("SSL_CTX_set_min_proto_version(TLS1_2_VERSION): %s", ERR_error_string(ERR_get_error(), 0));
         }
+
 #else
         if (!(ssl_ctx = SSL_CTX_new(SSLv23_client_method()))) {
             perf_log_fatal("SSL_CTX_new(): %s", ERR_error_string(ERR_get_error(), 0));
@@ -551,6 +574,8 @@ struct perf_net_socket* perf_net_dot_opensocket(const perf_sockaddr_t* server, c
 #endif
         SSL_CTX_set_mode(ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
         SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT);
+
+        SSL_CTX_set_keylog_callback(ssl_ctx, SSL_keylog_cb);
 
         g_ex_index = SSL_get_ex_new_index(0, "dot_socket", NULL, NULL, NULL);
 if (g_ex_index == -1) {
@@ -565,4 +590,58 @@ SSL_CTX_sess_set_new_cb(ssl_ctx, dot_new_session_cb);
     perf__dot_connect(sock);
 
     return sock;
+}
+
+static void save_session_to_file(SSL_SESSION *session, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        perf_log_warning("Could not open %s for writing session", path);
+        return;
+    }
+
+    unsigned char *data = NULL;
+    int len = i2d_SSL_SESSION(session, &data);
+    if (len <= 0) {
+        perf_log_warning("Failed to serialize SSL session");
+        fclose(fp);
+        return;
+    }
+
+    fwrite(data, 1, len, fp);
+    fclose(fp);
+    OPENSSL_free(data);
+    perf_log_printf("DoT: saved TLS session to %s", path);
+}
+
+static SSL_SESSION *load_session_from_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        perf_log_warning("No existing session file %s", path);
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    unsigned char *data = malloc(len);
+    if (!data) {
+        fclose(fp);
+        return NULL;
+    }
+
+    fread(data, 1, len, fp);
+    fclose(fp);
+
+    const unsigned char *p = data;
+    SSL_SESSION *sess = d2i_SSL_SESSION(NULL, &p, len);
+    free(data);
+
+    if (!sess) {
+        perf_log_warning("Failed to parse saved SSL session");
+        return NULL;
+    }
+
+    perf_log_printf("DoT: loaded TLS session from %s", path);
+    return sess;
 }
