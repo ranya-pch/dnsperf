@@ -34,6 +34,9 @@
 #include <netinet/in.h>
 #include <ck_pr.h>
 
+static void save_session_to_file(SSL_SESSION *session, const char *path);
+static SSL_SESSION *load_session_from_file(const char *path);
+
 static SSL_CTX* ssl_ctx = 0;
 
 static int g_ex_index = -1;
